@@ -1,0 +1,6 @@
+interface:
+  display_name: "模型选择"
+  short_description: "评估任务风险，并按 CodexRadar 推荐模型、推理档位与速度模式"
+  default_prompt: "Use $choose-codex-model to assess this Codex task and recommend the next model configuration."
+policy:
+  allow_implicit_invocation: true
