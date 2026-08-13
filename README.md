@@ -1,6 +1,6 @@
 # choose-codex-model
 
-中文：一个面向 Codex 工作流的模型选择 Skill。它结合任务风险、质量门槛、候选池完整性和 CodexRadar 的公开指标，给出可解释的建议；该技能不会自动切换您的当前生效配置。
+中文：一个面向 Codex 工作流的模型选择 Skill。它结合任务风险、质量门槛、候选池完整性和 CodexRadar 的公开指标，给出可解释的建议；它 does not automatically switch your active configuration.
 
 English: A model-selection Skill for Codex workflows. It combines task risk, quality gates, candidate-pool completeness, and public CodexRadar metrics to produce explainable recommendations; it does not automatically switch your active configuration.
 
@@ -8,7 +8,8 @@ English: A model-selection Skill for Codex workflows. It combines task risk, qua
 
 - Six-dimension risk assessment and quality-first filtering.
 - Cost-first ranking: Radar IQ 10%, average-price ratio 70%, average duration 15%, and evidence 5%; Radar contributes 80% and task fit contributes 20%.
-- A complete current Codex App model-picker list is required before a new configuration can be ranked.
+- A complete current Codex App model-picker list is required before an account-verified configuration can be ranked; when that list is unknown, default mode can still give a clearly labelled public Radar-only comparison from the known Codex model family, never a third-party Radar model.
+- The Skill automatically uses model and reasoning-effort metadata already surfaced for the current task. It does not read, click, scrape, or infer the native model picker.
 - Live Radar data may fall back only to a schema-validated local temporary cache no older than 24 hours.
 - Strict mode, unknown configuration, and an unqualified current configuration retain their pause protections. A qualified short task is not interrupted merely because another qualified candidate scores higher.
 
@@ -28,9 +29,13 @@ English: A model-selection Skill for Codex workflows. It combines task risk, qua
 
 ## Use / 使用
 
-Obtain the complete current model-picker list from your Codex App. Only that complete list may set `available_complete` to `true`. Official documentation can establish public model information, but it cannot establish your account availability.
+At the start of an assessment, the Skill automatically passes the current task's surfaced model and reasoning effort as `runtime_current` when the host exposes them. It never invents an unknown Standard/Fast value, and it does not read, click, scrape, or infer the native model picker.
 
-请从当前 Codex App 获取完整模型选择器列表。只有这份完整列表才能设置 `available_complete=true`；官方文档不能证明某个模型在你的账户中可用。
+Obtain the complete current model-picker list from your Codex App when you want an account-verified configuration recommendation. Only that complete list may set `available_complete` to `true`. Official documentation can establish public model information, but it cannot establish your account availability.
+
+开始评估时，如果宿主已暴露本任务的模型和推理档位，Skill 会自动作为 `runtime_current` 传入；它不会猜测 Standard/Fast，也不会读取、点击、抓取或推断原生模型选择器。
+
+如需“账户已验证”的配置推荐，请从当前 Codex App 提供完整模型选择器列表。只有这份完整列表才能设置 `available_complete=true`；官方文档不能证明某个模型在你的账户中可用。
 
 Example prepare input:
 
@@ -46,12 +51,14 @@ Example prepare input:
     "verification": 1
   },
   "current": null,
+  "runtime_current": {"model": "gpt-5.6-terra", "effort": "xhigh"},
+  "runtime_current_source": "codex_task_metadata",
   "available": null,
   "available_complete": false
 }
 ```
 
-Pipe that JSON to `skill/scripts/recommend.py`. A false availability marker intentionally returns a warning instead of inventing availability or a recommendation.
+Pipe that JSON to `skill/scripts/recommend.py` with `action=prepare`. If a valid non-strict result has `available_complete=false`, then pass the complete prepared object back with `action=radar_only`. It returns a public Radar-only recommendation only from the known Codex model family, never a third-party Radar model. When a user explicitly enables `luna_quality_baseline`, a public Luna max metric may raise the quality floor; this does not establish Luna account availability. Its output explicitly says that account availability is unverified, and it does not automatically switch anything. Strict mode and genuinely insufficient Radar data still return no new recommendation.
 
 ## Configuration / 配置
 
