@@ -1,6 +1,6 @@
 # choose-codex-model
 
-中文：一个面向 Codex 工作流的模型选择 Skill。它结合任务风险、质量门槛、候选池完整性和 CodexRadar 的公开指标，给出可解释的建议；它 does not automatically switch your active configuration.
+中文：一个面向 Codex 工作流的模型选择 Skill。它结合任务风险、质量门槛、候选池完整性和 CodexRadar 的公开指标，给出可解释的建议；该技能不会自动切换您的当前生效配置。
 
 English: A model-selection Skill for Codex workflows. It combines task risk, quality gates, candidate-pool completeness, and public CodexRadar metrics to produce explainable recommendations; it does not automatically switch your active configuration.
 
