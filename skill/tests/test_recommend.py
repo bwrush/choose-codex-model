@@ -367,6 +367,130 @@ class PrepareTests(unittest.TestCase):
                 ):
                     recommend.prepare(payload, data, insights(), NOW)
 
+    def test_prepare_keeps_runtime_metadata_separate_from_full_current_configuration(
+        self,
+    ):
+        payload = self.payload(60)
+        payload["current"] = None
+        payload["runtime_current"] = {
+            "model": "gpt-5.6-terra",
+            "effort": "xhigh",
+        }
+        payload["runtime_current_source"] = "codex_task_metadata"
+
+        prepared = recommend.prepare(
+            payload,
+            metrics([point("gpt-5.6-terra", "xhigh", 96, 2, 20)]),
+            current_radar_insights(),
+            NOW,
+        )
+
+        self.assertIn("runtime_current", prepared)
+        self.assertIn("runtime_current_source", prepared)
+        self.assertIsNone(prepared["current"])
+        self.assertEqual(
+            prepared["runtime_current"], {"model": "terra", "effort": "xhigh"}
+        )
+        self.assertEqual(prepared["runtime_current_source"], "codex_task_metadata")
+        self.assertTrue(prepared["compatibility_verified"])
+
+    def test_prepare_rejects_invalid_runtime_metadata_before_radar_validation(self):
+        data = metrics([point("sol", "high", 93, 4, 20)])
+
+        cases = (
+            ({"model": "terra"}, "runtime_current model and effort must be valid"),
+            ({"model": "terra", "effort": ""}, "runtime_current model and effort must be valid"),
+            (["terra", "xhigh"], "runtime_current must be a mapping or None"),
+            ({"model": "terra", "effort": "xhigh"}, "runtime_current_source must be codex_task_metadata, user_supplied, or unspecified"),
+        )
+
+        for runtime_current, message in cases:
+            with self.subTest(runtime_current=runtime_current):
+                payload = self.payload(60)
+                payload["runtime_current"] = runtime_current
+                if runtime_current == {"model": "terra", "effort": "xhigh"}:
+                    payload["runtime_current_source"] = "history"
+                with self.assertRaisesRegex(ValueError, f"^{message}$"):
+                    recommend.prepare(payload, data, insights(), NOW)
+
+    def test_prepare_normalizes_non_string_runtime_metadata_source_to_value_error(self):
+        payload = self.payload(60)
+        payload["runtime_current"] = {"model": "terra", "effort": "xhigh"}
+        payload["runtime_current_source"] = []
+
+        try:
+            recommend.prepare(
+                payload, metrics([point("sol", "high", 93, 4, 20)]), insights(), NOW
+            )
+        except Exception as exc:
+            self.assertIsInstance(exc, ValueError)
+            self.assertEqual(
+                str(exc),
+                "runtime_current_source must be codex_task_metadata, user_supplied, or unspecified",
+            )
+        else:
+            self.fail("non-string runtime_current_source must be rejected")
+
+    def test_incomplete_pool_keeps_only_known_codex_models_for_radar_only(self):
+        payload = self.payload(42.5)
+        payload["current"] = None
+        payload["available"] = None
+        payload["available_complete"] = False
+        payload["runtime_current"] = {"model": "gpt-5.6-terra", "effort": "max"}
+        payload["runtime_current_source"] = "codex_task_metadata"
+        data = metrics(
+            [
+                point("gpt-5.6-sol", "xhigh", 102.14, 6.290296, 25.91),
+                point("gpt-5.6-terra", "xhigh", 84.64, 1.803446, 18.4),
+                point("gpt-5.6-luna", "max", 93.57, 0.474308, 32.6),
+                point("deepseek-v4-flash", "high", 99.0, 0.01, 5.0),
+            ]
+        )
+
+        prepared = recommend.prepare(payload, data, current_radar_insights(), NOW)
+        prepared["data"] = {"source": "live", "age_seconds": 0.0}
+
+        self.assertNotIn(
+            "deepseek-v4-flash|high|standard",
+            [item["key"] for item in prepared["candidates"]],
+        )
+        radar_only = recommend.radar_only(prepared)
+        self.assertEqual(radar_only["recommendation"]["key"], "luna|max|standard")
+
+    def test_radar_only_uses_an_explicit_public_luna_baseline_without_picker_access(
+        self,
+    ):
+        payload = self.payload(20)
+        payload.update(
+            {
+                "current": None,
+                "available": None,
+                "available_complete": False,
+                "runtime_current": {"model": "gpt-5.6-terra", "effort": "max"},
+                "runtime_current_source": "codex_task_metadata",
+                "luna_max_fast_preference": True,
+                "luna_quality_baseline": True,
+            }
+        )
+        data = metrics(
+            [
+                point("gpt-5.6-sol", "xhigh", 102.0, 6.0, 26.0),
+                point("gpt-5.6-terra", "max", 96.0, 2.0, 20.0),
+                point("gpt-5.6-luna", "max", 94.0, 0.4, 32.0),
+                point("gpt-5.6-luna", "high", 98.0, 0.3, 30.0),
+            ]
+        )
+
+        prepared = recommend.prepare(payload, data, current_radar_insights(), NOW)
+        prepared["data"] = {"source": "live", "age_seconds": 0.0}
+
+        self.assertEqual(prepared["luna_quality_baseline_iq"], 94.0)
+        self.assertEqual(prepared["quality_floor"], 94.0)
+        self.assertNotIn("Luna max quality baseline is unavailable", prepared["reasons"])
+        radar_only = recommend.radar_only(prepared)
+        self.assertEqual(radar_only["status"], "continue")
+        self.assertEqual(radar_only["recommendation"]["key"], "luna|max|fast")
+
     def test_current_radar_rules_apply_l4_filter_after_quality_gate(self):
         prepared = recommend.prepare(
             self.payload(75),
@@ -2059,6 +2183,91 @@ class RankingTests(unittest.TestCase):
         self.assertIn("recommendation data is insufficient", result["reasons"])
 
 
+class RadarOnlyTests(unittest.TestCase):
+    def prepared(self, strict=False):
+        prepared = RankingTests().prepared()
+        prepared.update(
+            {
+                "status": "warn",
+                "strict": strict,
+                "pause_on_change": True,
+                "available_complete": False,
+                "compatibility_verified": False,
+                "current": None,
+                "runtime_current": {"model": "terra", "effort": "xhigh"},
+                "runtime_current_source": "codex_task_metadata",
+            }
+        )
+        return prepared
+
+    def radar_only(self, prepared):
+        self.assertTrue(hasattr(recommend, "radar_only"))
+        return recommend.radar_only(prepared)
+
+    def test_unverified_pool_gets_a_non_blocking_public_radar_recommendation(self):
+        result = self.radar_only(self.prepared())
+
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(result["mode"], "radar_only")
+        self.assertEqual(result["recommendation_scope"], "public_radar_only")
+        self.assertFalse(result["account_availability_verified"])
+        self.assertEqual(result["confidence"], "high")
+        self.assertEqual(result["availability_confidence"], "unverified")
+        self.assertEqual(result["recommendation"]["key"], "luna|max|standard")
+        self.assertEqual(
+            result["runtime_current"], {"model": "terra", "effort": "xhigh"}
+        )
+        self.assertIn("account availability is unverified", result["reasons"])
+
+    def test_radar_only_cannot_relax_the_verified_rank_gate(self):
+        prepared = self.prepared()
+        fit = {
+            item["key"]: {
+                "effort": 0,
+                "workload": 0,
+                "latency": 0,
+                "execution_horizon": 0,
+                "reason": "not used by Radar-only",
+            }
+            for item in prepared["candidates"]
+        }
+
+        self.radar_only(prepared)
+
+        with self.assertRaisesRegex(
+            ValueError, "^available model list is incomplete or unverified$"
+        ):
+            recommend.rank_candidates(prepared, fit)
+
+    def test_strict_mode_keeps_the_complete_picker_pause_protection(self):
+        result = self.radar_only(self.prepared(strict=True))
+
+        self.assertEqual(result["status"], "pause")
+        self.assertIsNone(result["recommendation"])
+        self.assertIn("strict mode requires a complete verified available model list", result["reasons"])
+
+    def test_missing_public_candidates_never_produces_a_radar_only_recommendation(self):
+        prepared = self.prepared()
+        prepared["candidates"] = []
+
+        result = self.radar_only(prepared)
+
+        self.assertEqual(result["status"], "warn")
+        self.assertIsNone(result["recommendation"])
+        self.assertIn("no qualified public Radar candidates", result["reasons"])
+
+    def test_run_routes_radar_only_without_fetching_again(self):
+        prepared = self.prepared()
+
+        try:
+            result = recommend.run({"action": "radar_only", "prepared": prepared})
+        except ValueError as exc:
+            self.fail(f"radar_only action must be routed: {exc}")
+
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(result["recommendation"]["key"], "luna|max|standard")
+
+
 class InterfaceTests(unittest.TestCase):
     def setUp(self):
         self.metrics = metrics([point("sol", "xhigh", 109, 6, 26)])
@@ -2246,6 +2455,36 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(error["status"], "error")
         self.assertIn("invalid JSON constant", error["error"])
         self.assertNotIn("NaN", output.getvalue())
+
+    def test_prepare_action_retains_runtime_metadata_when_radar_is_unavailable(self):
+        payload = {
+            "action": "prepare",
+            "risk_dimensions": {name: 0 for name in recommend.RISK_WEIGHTS},
+            "force_l4": False,
+            "current": None,
+            "runtime_current": {"model": "gpt-5.6-terra", "effort": "xhigh"},
+            "runtime_current_source": "codex_task_metadata",
+            "available": None,
+            "available_complete": False,
+            "strict": False,
+            "pause_on_change": False,
+            "latency_priority": "normal",
+            "allow_fast": False,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = recommend.run(
+                payload,
+                cache_path=Path(directory) / "missing-cache.json",
+                now=NOW,
+                fetcher=(lambda _url: (_ for _ in ()).throw(OSError("offline"))),
+            )
+
+        self.assertIn("runtime_current", result)
+        self.assertIn("runtime_current_source", result)
+        self.assertEqual(result["runtime_current"], {"model": "terra", "effort": "xhigh"})
+        self.assertEqual(result["runtime_current_source"], "codex_task_metadata")
+        self.assertIsNone(result["current"])
 
     def test_prepare_action_defaults_adaptive_notice_controls(self):
         payload = {
@@ -3338,6 +3577,43 @@ class SkillContractTests(unittest.TestCase):
             "remembered or partial list may be used as a compatibility allowlist",
             self.skill,
         )
+
+    def test_runtime_metadata_and_radar_only_fallback_are_documented(self):
+        workflow = self.skill.split("## Assessment workflow", 1)[1].split(
+            "## Modes", 1
+        )[0]
+        policy = self.skill.split("## Non-negotiable policy", 1)[1].split(
+            "## Risk assessment", 1
+        )[0]
+
+        for text in (
+            "For every assessment, first read the host's surfaced task metadata",
+            "`runtime_current`",
+            "`runtime_current_source=codex_task_metadata`",
+            "Do not read, click, scrape, or infer the native model picker.",
+            "Do not synthesize a `speed` value",
+            "pass `current=null`",
+            "When `available_complete=false` and strict mode is off",
+            "action=radar_only",
+            "public Radar-only recommendation",
+            "account availability is unverified",
+            "known Codex model family",
+            "never emit a third-party Radar model",
+            "explicit public Luna quality baseline",
+            "does not establish Luna account availability",
+            "continue the task",
+            "Strict mode keeps the complete-picker pause protection",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, workflow)
+
+        for text in (
+            "account-verified configuration recommendation",
+            "`radar_only` recommendation",
+            "must never claim account availability",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, policy)
 
     def test_force_l4_is_a_minimum_and_example_uses_actual_six_dimension_score(self):
         self.assertIn("### Force-L4 output", self.skill)

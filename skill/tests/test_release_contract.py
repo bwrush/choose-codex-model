@@ -61,6 +61,20 @@ class ReleaseContractTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, readme)
 
+    def test_readme_distinguishes_verified_and_radar_only_recommendations(self):
+        readme = self.required_text("README.md")
+
+        for phrase in (
+            "account-verified configuration",
+            "Radar-only",
+            "account availability is unverified",
+            "does not read, click, scrape, or infer the native model picker",
+            "known Codex model family",
+            "third-party Radar model",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, readme)
+
     def test_release_has_no_generated_artifacts_or_personal_text(self):
         artifacts = []
         for path in ROOT.rglob("*"):
