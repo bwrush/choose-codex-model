@@ -75,6 +75,7 @@ RADAR_MODEL_ALIASES = {
     "gpt-5.6-terra": "terra",
     "gpt-5.6-luna": "luna",
 }
+KNOWN_CODEX_RADAR_MODELS = frozenset(RADAR_MODEL_ALIASES.values())
 TASK_HORIZONS = {"short", "long"}
 LARGE_SAVINGS_RATIO = 0.50
 
@@ -152,6 +153,10 @@ def _canonical_model(model):
     return RADAR_MODEL_ALIASES.get(model, model)
 
 
+def _is_known_codex_radar_model(model):
+    return _canonical_model(model) in KNOWN_CODEX_RADAR_MODELS
+
+
 def candidate_key(model, effort, speed="standard"):
     if not all(isinstance(value, str) and value.strip() and "|" not in value
                for value in (model, effort, speed)):
@@ -170,6 +175,42 @@ def _normalize_current(current):
         raise ValueError("current model, effort, and speed must be valid") from exc
     return {"model": _canonical_model(current["model"]),
             "effort": current["effort"], "speed": current["speed"]}
+
+
+RUNTIME_CURRENT_SOURCES = {
+    "codex_task_metadata",
+    "user_supplied",
+    "unspecified",
+}
+
+
+def _normalize_runtime_current(runtime_current):
+    if runtime_current is None:
+        return None
+    if not isinstance(runtime_current, Mapping):
+        raise ValueError("runtime_current must be a mapping or None")
+    try:
+        candidate_key(runtime_current.get("model"), runtime_current.get("effort"))
+    except ValueError as exc:
+        raise ValueError("runtime_current model and effort must be valid") from exc
+    return {
+        "model": _canonical_model(runtime_current["model"]),
+        "effort": runtime_current["effort"],
+    }
+
+
+def _normalize_runtime_current_source(source, runtime_current):
+    if runtime_current is None:
+        if source is not None:
+            raise ValueError("runtime_current_source requires runtime_current")
+        return None
+    if source is None:
+        return "unspecified"
+    if not isinstance(source, str) or source not in RUNTIME_CURRENT_SOURCES:
+        raise ValueError(
+            "runtime_current_source must be codex_task_metadata, user_supplied, or unspecified"
+        )
+    return source
 
 
 def _payload_controls(payload):
@@ -201,8 +242,13 @@ def _payload_controls(payload):
         available_valid, _available_pairs = validated_pairs(payload.get("available"))
         if not available_valid:
             raise ValueError("available must be a valid list when available_complete is true")
+    runtime_current = _normalize_runtime_current(payload.get("runtime_current"))
+    runtime_current_source = _normalize_runtime_current_source(
+        payload.get("runtime_current_source"), runtime_current
+    )
     return (*controls, latency_priority, comparison_speed, task_horizon, notify_on_large_savings,
-            available_complete, _normalize_current(payload.get("current")))
+            available_complete, _normalize_current(payload.get("current")), runtime_current,
+            runtime_current_source)
 
 
 def validated_pairs(items):
@@ -263,8 +309,9 @@ def prepare(payload, metrics, insights, now=None):
     if not isinstance(insights, Mapping):
         raise ValueError("insights must be a mapping")
     (strict, pause_on_change, allow_fast, luna_max_fast_preference,
-     luna_quality_baseline, latency_priority, comparison_speed, task_horizon,
-     notify_on_large_savings, available_complete, current) = _payload_controls(payload)
+      luna_quality_baseline, latency_priority, comparison_speed, task_horizon,
+      notify_on_large_savings, available_complete, current, runtime_current,
+      runtime_current_source) = _payload_controls(payload)
     output_speed = choose_speed(latency_priority, allow_fast)
     if "risk_score" not in payload:
         raise ValueError("payload missing risk_score")
@@ -289,8 +336,12 @@ def prepare(payload, metrics, insights, now=None):
             normalized = dict(item)
             normalized["model"] = _canonical_model(item["model"])
             numeric_points.append(normalized)
-    compatible = [item for item in numeric_points
-                  if not available_complete or (item.get("model"), item.get("effort")) in allowed]
+    compatible = (
+        [item for item in numeric_points
+         if (item.get("model"), item.get("effort")) in allowed]
+        if available_complete else
+        [item for item in numeric_points if _is_known_codex_radar_model(item["model"])]
+    )
     fresh_points = []
     for item in compatible:
         try:
@@ -334,8 +385,8 @@ def prepare(payload, metrics, insights, now=None):
         })
     base_threshold = policy.get(risk["level"], policy["L4_min"])
     luna_baseline_iq = (
-        _luna_max_baseline_iq(candidates)
-        if luna_quality_baseline and compatibility_verified else None)
+        _luna_max_baseline_iq(candidates) if luna_quality_baseline else None
+    )
     baseline_unavailable = luna_quality_baseline and luna_baseline_iq is None
     threshold = None if baseline_unavailable else max(
         base_threshold,
@@ -403,6 +454,8 @@ def prepare(payload, metrics, insights, now=None):
         "quality_floor": threshold,
         "candidates": candidates,
         "current": current,
+        "runtime_current": runtime_current,
+        "runtime_current_source": runtime_current_source,
         "strict": strict,
         "pause_on_change": pause_on_change,
         "task_horizon": task_horizon,
@@ -487,7 +540,7 @@ def _speed_source(prepared, candidate=None):
             else "default")
 
 
-def _validated_candidates(prepared):
+def _validated_candidates(prepared, require_verified_compatibility=True):
     if not isinstance(prepared, Mapping):
         raise ValueError("prepared must be a mapping")
     for name, default in (("strict", False), ("pause_on_change", False),
@@ -498,8 +551,9 @@ def _validated_candidates(prepared):
                           ("luna_max_fast_preference", False),
                           ("luna_quality_baseline", False)):
         _prepared_bool(prepared, name, default)
-    if (not _prepared_bool(prepared, "available_complete", False)
-            or not _prepared_bool(prepared, "compatibility_verified", False)):
+    if (require_verified_compatibility
+            and (not _prepared_bool(prepared, "available_complete", False)
+                 or not _prepared_bool(prepared, "compatibility_verified", False))):
         raise ValueError("available model list is incomplete or unverified")
     _prepared_task_horizon(prepared)
     _prepared_comparison_speed(prepared)
@@ -616,10 +670,8 @@ def _fit_points(candidate_keys, task_fit):
     return totals
 
 
-def rank_candidates(prepared, task_fit):
-    candidates = _validated_candidates(prepared)
-    keys = [item["key"] for item in candidates]
-    fit_points = _fit_points(keys, task_fit)
+def _score_radar_candidates(candidates):
+    candidates = [dict(item) for item in candidates]
     iq_scores = percentile_scores([item["iq"] for item in candidates], True)
     price_scores = relative_price_scores([item["price"] for item in candidates])
     time_scores = percentile_scores([item["minutes"] for item in candidates], False)
@@ -634,6 +686,15 @@ def rank_candidates(prepared, task_fit):
         radar = (0.10 * iq_scores[index] + 0.70 * price_scores[index]
                  + 0.15 * time_scores[index] + 0.05 * evidence_scores[index])
         item["radar_score"] = radar
+    return candidates
+
+
+def rank_candidates(prepared, task_fit):
+    candidates = _validated_candidates(prepared)
+    keys = [item["key"] for item in candidates]
+    fit_points = _fit_points(keys, task_fit)
+    candidates = _score_radar_candidates(candidates)
+    for item in candidates:
         item["task_fit_points"] = fit_points[item["key"]]
         item["total_score"] = item["radar_score"] * 0.80 + fit_points[item["key"]]
         item["task_fit_reason"] = task_fit[item["key"]]["reason"].strip()
@@ -660,6 +721,106 @@ def confidence_for(prepared):
     if data.get("source") == "cache":
         return "medium"
     return "low"
+
+
+def _radar_data_confidence_for(prepared):
+    if not isinstance(prepared, Mapping):
+        return "low"
+    if prepared.get("degradation_verified") is not True:
+        return "low"
+    data = prepared.get("data")
+    if not isinstance(data, Mapping):
+        return "low"
+    age_seconds = data.get("age_seconds")
+    if (not isinstance(age_seconds, (int, float)) or isinstance(age_seconds, bool)
+            or not math.isfinite(age_seconds) or age_seconds < 0
+            or age_seconds > MAX_DATA_AGE_SECONDS):
+        return "low"
+    if data.get("source") == "live":
+        return "high"
+    if data.get("source") == "cache":
+        return "medium"
+    return "low"
+
+
+def _prepared_runtime_current(prepared):
+    runtime_current = _normalize_runtime_current(prepared.get("runtime_current"))
+    runtime_current_source = _normalize_runtime_current_source(
+        prepared.get("runtime_current_source"), runtime_current
+    )
+    return runtime_current, runtime_current_source
+
+
+def _radar_only_result(prepared, status, recommendation, ranked, reasons,
+                       radar_data_confidence):
+    runtime_current, runtime_current_source = _prepared_runtime_current(prepared)
+    current = _normalize_current(prepared.get("current"))
+    speed_source = (
+        _speed_source(prepared, recommendation)
+        if recommendation is not None else _speed_source(prepared)
+    )
+    return {
+        "status": status,
+        "mode": "radar_only",
+        "recommendation_scope": "public_radar_only",
+        "account_availability_verified": False,
+        "risk": prepared.get("risk"),
+        "quality_floor": prepared.get("quality_floor"),
+        "recommendation": recommendation,
+        "ranked": ranked,
+        "current": current,
+        "runtime_current": runtime_current,
+        "runtime_current_source": runtime_current_source,
+        "confidence": radar_data_confidence,
+        "availability_confidence": "unverified",
+        "radar_data_confidence": radar_data_confidence,
+        "data": prepared.get("data", {}),
+        "speed_source": speed_source,
+        "reasons": reasons,
+        "change_notice": None,
+    }
+
+
+def radar_only(prepared):
+    if not isinstance(prepared, Mapping):
+        raise ValueError("prepared must be a mapping")
+    if prepared.get("status") not in ("prepared", "warn", "pause", "no_candidates"):
+        raise ValueError("prepared data must have a recognized status")
+    strict = _prepared_bool(prepared, "strict", False)
+    available_complete = _prepared_bool(prepared, "available_complete", False)
+    compatibility_verified = _prepared_bool(prepared, "compatibility_verified", False)
+    if available_complete or compatibility_verified:
+        raise ValueError(
+            "radar_only requires an incomplete or unverified available model list"
+        )
+    candidates = _validated_candidates(
+        prepared, require_verified_compatibility=False
+    )
+    radar_data_confidence = _radar_data_confidence_for(prepared)
+    reasons = ["account availability is unverified"]
+    if strict:
+        reasons.append("strict mode requires a complete verified available model list")
+        return _radar_only_result(
+            prepared, "pause", None, [], reasons, radar_data_confidence
+        )
+    if radar_data_confidence == "low":
+        reasons.append("Radar data is insufficient")
+        return _radar_only_result(
+            prepared, "warn", None, [], reasons, radar_data_confidence
+        )
+    if not candidates:
+        reasons.append("no qualified public Radar candidates")
+        return _radar_only_result(
+            prepared, "warn", None, [], reasons, radar_data_confidence
+        )
+    ranked = _score_radar_candidates(candidates)
+    ranked.sort(
+        key=lambda item: (-item["radar_score"], -item["iq"], item["price"],
+                          item["minutes"], item["key"])
+    )
+    return _radar_only_result(
+        prepared, "continue", ranked[0], ranked, reasons, radar_data_confidence
+    )
 
 
 def _validated_current(prepared):
@@ -869,13 +1030,23 @@ def run(payload, cache_path=CACHE_PATH, now=None, fetcher=fetch_json):
                 "reasons": ["prepared data must have status 'prepared'"],
             }
         return decide(prepared, payload["task_fit_by_candidate"])
+    if action == "radar_only":
+        prepared = payload.get("prepared")
+        if not isinstance(prepared, Mapping):
+            return {
+                "status": "pause",
+                "error": "prepared_not_radar_only",
+                "reasons": ["prepared data must be a mapping"],
+            }
+        return radar_only(prepared)
     if action == "render":
         return render_terminal_block(payload.get("terminal_block"))
     if action != "prepare":
-        raise ValueError("action must be prepare, rank, or render")
+        raise ValueError("action must be prepare, rank, radar_only, or render")
     (strict, pause_on_change, _allow_fast, _luna_max_fast_preference,
-     _luna_quality_baseline, _latency_priority, comparison_speed, task_horizon,
-     notify_on_large_savings, available_complete, current) = _payload_controls(payload)
+      _luna_quality_baseline, _latency_priority, comparison_speed, task_horizon,
+      notify_on_large_savings, available_complete, current, runtime_current,
+      runtime_current_source) = _payload_controls(payload)
     calculated_risk = calculate_risk(
         payload["risk_dimensions"], payload.get("force_l4", False))
     if "risk_score" in payload:
@@ -886,6 +1057,8 @@ def run(payload, cache_path=CACHE_PATH, now=None, fetcher=fetch_json):
     prepared_payload = dict(payload)
     prepared_payload["risk_score"] = risk["score"]
     prepared_payload["current"] = current
+    prepared_payload["runtime_current"] = runtime_current
+    prepared_payload["runtime_current_source"] = runtime_current_source
     prepared_payload["task_horizon"] = task_horizon
     prepared_payload["notify_on_large_savings"] = notify_on_large_savings
     prepared_payload["available_complete"] = available_complete
@@ -897,6 +1070,9 @@ def run(payload, cache_path=CACHE_PATH, now=None, fetcher=fetch_json):
             "status": "pause" if strict or (pause_on_change and current is None) else "warn",
             "error": "data_insufficient",
             "risk": risk,
+            "current": current,
+            "runtime_current": runtime_current,
+            "runtime_current_source": runtime_current_source,
             "confidence": "low",
             "data": {"source": "unavailable", "age_seconds": None},
             "reasons": [str(exc)],
